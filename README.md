@@ -1,8 +1,8 @@
 # Mall Backend
 
-一个基于 Spring Boot + MySQL + MyBatis 的电商后台，包含用户、商品、订单三个模块。
+一个基于 Spring Boot + MySQL + MyBatis + Redis 的电商后台，包含用户、商品、订单三个模块。
 
-项目目标是练习后端分层、数据库事务、并发扣库存和异常处理，不追求功能数量，追求每一条链路都跑通、能讲清楚。
+项目目标是练习后端分层、数据库事务、并发扣库存、异常处理和缓存设计，不追求功能数量，追求每一条链路都跑通、能讲清楚。
 
 ## 技术栈
 
@@ -10,16 +10,17 @@
 - Spring Boot 4.1.1
 - MySQL 9.5
 - MyBatis 4.1.0
+- Redis 7.x
 - Maven
 
 ## 功能
 
 ### 用户模块
-- 查询所有用户
-- 按 ID 查询用户
-- 新增用户
-- 修改用户
-- 删除用户
+- 查询所有商品
+- 按 ID 查询商品（带 Redis 缓存）
+- 新增商品
+- 修改商品（修改后清除缓存）
+- 删除商品（删除后清除缓存）
 
 ### 商品模块
 - 查询所有商品
@@ -29,7 +30,7 @@
 - 删除商品
 
 ### 订单模块
-- 下单（支持一次购买多个商品）
+- 下单（支持一次购买多个商品，事务保证原子性）
 - 查询所有订单
 - 按 ID 查询订单
 - 查询某订单的所有订单项
@@ -88,7 +89,11 @@ CREATE TABLE IF NOT EXISTS `order_item` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
-### 2.配置数据库
+### 2.启动 Redis
+
+项目默认连接 ```localhost:6379```，如需修改，改 ```application.properties``` 里的 ```spring.data.redis.host``` 和 ```spring.data.redis.port```。
+
+### 3.配置数据库
 
 复制 ```application.properties.example``` 为 ```application.properties```填入自己的数据库密码：
 
@@ -98,7 +103,7 @@ spring.datasource.username=root
 spring.datasource.password=你的密码
 ```
 
-### 3.启动
+### 4.启动
 
 ```bash
 mvn spring-boot:run
@@ -133,6 +138,12 @@ Content-Type: application/json
     "stock": 100,
     "description": "87键 青轴 白色背光"
 }
+```
+
+### 查询商品（带缓存）
+
+```text
+GET /products/1
 ```
 
 ### 下单
@@ -218,12 +229,33 @@ WHERE id = #{id} AND stock >= #{quantity}
 - 库存不足 → 400
 - 其他业务异常 → 500
 
+### 5.Redis 缓存
+
+商品详情使用 Redis 缓存，采用 Cache Aside 模式：先更新数据库，再删除缓存。
+
+解决了缓存的四个经典问题：
+
+缓存穿透：查询不存在的 id 时，MySQL 查不到，缓存 "null" 字符串，设短过期时间（2~4 分钟），避免同一无效 id 反复打到数据库。
+
+缓存击穿：热点 key 失效瞬间，大量请求同时打到数据库。使用按 key 加锁 + 双重检查解决：
+
+- 每个 key 对应一个 ReentrantLock，存在 ConcurrentHashMap 中；
+- 未命中的请求先抢锁，只有一个线程去查库；
+- 拿到锁后再次检查缓存（双重检查），防止等锁期间其他线程已写回；
+- 其他线程等锁释放后重新查缓存，命中直接返回。
+
+缓存雪崩：过期时间加随机偏移（10 + [0,5] 分钟），避免大量 key 同时失效。
+
+缓存一致性：修改或删除商品后，主动删除对应的 Redis key，下次查询重新从数据库加载。
+
 ## 已知限制
 
 1. 未实现登录鉴权，接口可直接访问；
 2. 订单状态目前只写入 PENDING，未实现状态流转；
 3. 未实现分页，列表接口一次返回全部数据；
 4. 未实现商品搜索、订单筛选等查询功能。
+5. 锁池未做清理，商品数量有界时可接受，无限增长的 key 场景应改用固定分片锁（如 Guava Striped）或引用计数方案；
+6. 未实现单元测试与集成测试。
 
 ## License
 
